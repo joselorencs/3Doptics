@@ -1,0 +1,9 @@
+# Core dependencies for 3D OPTICS
+streamlit>=1.32.0
+pandas>=2.2.2
+numpy>=1.26.4
+plotly>=5.20.0
+scipy>=1.13.0
+
+# Optional utilities
+uuid
