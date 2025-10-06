@@ -24,44 +24,92 @@ capture_basename = "plot_view"
 # ---------------------------
 # Helper: extract temperature from filename
 # ---------------------------
-def extract_temp_from_filename(filename: str):
+def expand_uploaded_to_spectra(uploaded_files, scale_to_percent=True, mode_key="spectroscopy"):
     """
-    Try to extract a temperature value from a filename.
-    Heuristics:
-     - Prefer numbers followed by °C, C, degC or K.
-     - Otherwise take the first numeric token plausible as temperature.
-     - Ignore 4-digit years (1900-2100).
-     - Accept comma or dot decimals.
-    Returns float or None if not found.
+    Accepts multiple uploaded files.
+    Each file can contain:
+      - Two columns (wavelength, property)  → one spectrum
+      - One wavelength + multiple property columns → multiple spectra from same file
+
+    Returns a list of entries ready for processing.
     """
-    name = filename
-    # Normalize separators to spaces
-    name = name.replace("_", " ").replace("-", " ").replace(".", " ")
-    # Patterns: prefer with unit markers
-    num_re = r'([+-]?\d{1,4}(?:[.,]\d+)?)'
-    patterns = [
-        rf'{num_re}\s*(?:°\s*[Cc]|deg\s*[Cc]|C\b)',    # e.g. 100C, 100 °C, 100degC
-        rf'{num_re}\s*(?:K\b)',                       # Kelvin
-        rf'(?:T|temp|temperature)\s*[:=_]?\s*{num_re}',# T=100 or temp_100
-        num_re                                        # fallback: any number
-    ]
-    for pat in patterns:
-        m = re.search(pat, name, flags=re.IGNORECASE)
-        if m:
-            raw = m.group(1)
-            raw = raw.replace(",", ".")
+    class InMemoryFile(io.StringIO):
+        def __init__(self, s, name):
+            super().__init__(s)
+            self.name = name
+
+    entries = []
+    idx_global = 0
+
+    for up in uploaded_files:
+        # Read full text once
+        try:
+            text = up.getvalue().decode("utf-8", errors="ignore")
+        except Exception:
+            text = up.read().decode("utf-8", errors="ignore")
+
+        # Try various separators
+        df_raw = None
+        for sep in [";", ",", "\t"]:
             try:
-                val = float(raw)
+                df_try = pd.read_csv(io.StringIO(text), sep=sep, header=0)
+                if df_try.shape[1] >= 2:
+                    df_raw = df_try
+                    break
             except Exception:
                 continue
-            # ignore years like 1900-2100
-            if 1900 <= int(math.floor(val)) <= 2100:
+
+        if df_raw is None or df_raw.shape[1] < 2:
+            st.warning(f"File **{up.name}** must have at least two columns (wavelength + property). Skipping.")
+            continue
+
+        # Replace decimal commas with dots
+        df_raw = df_raw.applymap(lambda x: str(x).replace(",", ".") if isinstance(x, str) else x)
+
+        wl = pd.to_numeric(df_raw.iloc[:, 0], errors="coerce")
+        if wl.dropna().empty:
+            st.warning(f"Could not parse wavelength column in file **{up.name}**. Skipping file.")
+            continue
+
+        # Process each property column
+        for j in range(1, df_raw.shape[1]):
+            col_series = pd.to_numeric(df_raw.iloc[:, j], errors="coerce")
+            if col_series.dropna().empty:
                 continue
-            # sanity bounds
-            if val < -500 or val > 5000:
+
+            df_two = pd.DataFrame({"wavelength": wl, "prop": col_series}).dropna().sort_values("wavelength")
+            if df_two.empty:
                 continue
-            return val
-    return None
+
+            if scale_to_percent and df_two["prop"].max() <= 1.01:
+                df_two["prop"] *= 100.0
+
+            col_label = str(df_raw.columns[j])
+            temp_guess = None
+            parsed_from_col = extract_temp_from_filename(col_label)
+            if parsed_from_col is not None:
+                temp_guess = float(parsed_from_col)
+            else:
+                parsed_from_name = extract_temp_from_filename(up.name)
+                if parsed_from_name is not None:
+                    temp_guess = float(parsed_from_name)
+
+            csv_text = df_two.to_csv(index=False)
+            synthetic_name = f"{up.name}__col{j}__{col_label}"
+            memfile = InMemoryFile(csv_text, synthetic_name)
+
+            temp_key = f"{mode_key}_temp_{idx_global}"
+            idx_global += 1
+
+            entries.append({
+                "fileobj": memfile,
+                "label": f"{up.name} — column: {col_label}",
+                "temp_key": temp_key,
+                "temp_default": float(temp_guess) if temp_guess is not None else None
+            })
+
+    return entries
+
 
 # ---------------------------
 # Helper: spectrum reader (robust to separators; conditional scaling to percent)
@@ -112,15 +160,13 @@ def read_spectrum(file_like, scale_to_percent=True):
 # ---------------------------
 def expand_uploaded_to_spectra(uploaded_files, scale_to_percent=True, mode_key="spectroscopy"):
     """
-    Input: list of uploaded files
-    Output: list of dicts with keys:
-      - fileobj: in-memory two-column CSV (wavelength, prop)
-      - label: human label for UI
-      - temp_key: unique key for temperature input
-      - temp_default: float or None
-    Supports multi-column files (first column = wavelength, others = property at different T).
+    Accepts multiple uploaded files.
+    Each file can contain:
+      - Two columns (wavelength, property)  → one spectrum
+      - One wavelength + multiple property columns → multiple spectra from same file
+
+    Returns a list of entries ready for processing.
     """
-    import io
     class InMemoryFile(io.StringIO):
         def __init__(self, s, name):
             super().__init__(s)
@@ -130,36 +176,36 @@ def expand_uploaded_to_spectra(uploaded_files, scale_to_percent=True, mode_key="
     idx_global = 0
 
     for up in uploaded_files:
-        up.seek(0)
-        content = up.read().decode("utf-8", errors="ignore").strip()
+        # Read full text once
+        try:
+            text = up.getvalue().decode("utf-8", errors="ignore")
+        except Exception:
+            text = up.read().decode("utf-8", errors="ignore")
 
-        # --- Detect delimiter automatically ---
-        sniffers = [",", ";", "\t", " "]
-        best_df = None
-        best_cols = 0
-        for sep in sniffers:
+        # Try various separators
+        df_raw = None
+        for sep in [";", ",", "\t"]:
             try:
-                df_try = pd.read_csv(io.StringIO(content), sep=sep, engine="python")
-                if df_try.shape[1] > best_cols:
-                    best_cols = df_try.shape[1]
-                    best_df = df_try
+                df_try = pd.read_csv(io.StringIO(text), sep=sep, header=0)
+                if df_try.shape[1] >= 2:
+                    df_raw = df_try
+                    break
             except Exception:
                 continue
-        df_raw = best_df
 
         if df_raw is None or df_raw.shape[1] < 2:
-            st.warning(f"⚠️ File **{up.name}** must have at least two numeric columns (wavelength + property). Skipping.")
+            st.warning(f"File **{up.name}** must have at least two columns (wavelength + property). Skipping.")
             continue
 
         # Replace decimal commas with dots
         df_raw = df_raw.applymap(lambda x: str(x).replace(",", ".") if isinstance(x, str) else x)
 
-        # Convert to numeric
         wl = pd.to_numeric(df_raw.iloc[:, 0], errors="coerce")
         if wl.dropna().empty:
-            st.warning(f"⚠️ Could not parse wavelength column in file **{up.name}**. Skipping.")
+            st.warning(f"Could not parse wavelength column in file **{up.name}**. Skipping file.")
             continue
 
+        # Process each property column
         for j in range(1, df_raw.shape[1]):
             col_series = pd.to_numeric(df_raw.iloc[:, j], errors="coerce")
             if col_series.dropna().empty:
@@ -174,7 +220,6 @@ def expand_uploaded_to_spectra(uploaded_files, scale_to_percent=True, mode_key="
 
             col_label = str(df_raw.columns[j])
             temp_guess = None
-
             parsed_from_col = extract_temp_from_filename(col_label)
             if parsed_from_col is not None:
                 temp_guess = float(parsed_from_col)
@@ -590,7 +635,7 @@ if main_mode == "Home":
     st.header("Welcome to 3D OPTICS")
     banner_path = "3Doptics_banner.png"
     if os.path.exists(banner_path):
-        st.image(banner_path, use_container_width=True)
+        st.image(banner_path, width="stretch")
     else:
         st.info("Insert your banner image at /assets/banner.png to show it here.")
     
@@ -638,7 +683,13 @@ elif main_mode == "Spectroscopy":
                         st.session_state[e["temp_key"]] = float(e["temp_default"])
                     else:
                         st.session_state[e["temp_key"]] = 25.0
-                temp_val = col.number_input(f"Temperature for {e['label']}", value=float(st.session_state[e["temp_key"]]), step=0.1, format="%.3f", key=e["temp_key"])
+                temp_val = col.number_input(
+                    f"Temperature for {e['label']}",
+                    step=0.1,
+                    format="%.3f",
+                    key=e["temp_key"]
+                )
+
                 file_objs.append(e["fileobj"])
                 temps.append(float(temp_val))
 
@@ -711,7 +762,13 @@ elif main_mode == "Ellipsometry":
                         st.session_state[e["temp_key"]] = float(e["temp_default"])
                     else:
                         st.session_state[e["temp_key"]] = 25.0
-                temp_val = col.number_input(f"Temperature for {e['label']}", value=float(st.session_state[e["temp_key"]]), step=0.1, format="%.3f", key=e["temp_key"])
+                temp_val = col.number_input(
+                    f"Temperature for {e['label']}",
+                    step=0.1,
+                    format="%.3f",
+                    key=e["temp_key"]
+                )
+
                 file_objs.append(e["fileobj"])
                 temps.append(float(temp_val))
 
