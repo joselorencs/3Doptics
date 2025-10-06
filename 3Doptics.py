@@ -539,7 +539,7 @@ def process_and_display_spectra(file_objs, temps, options, property_name="Transm
         fig2 = px.imshow(Z_sorted_local, x=np.round(wl_grid_local, 6), y=np.round(temps_list_local, 6), origin="lower", aspect="auto",
                          labels={"x": "Wavelength (nm)", "y": "Temperature", "color": f"{property_name}{unit_label}"})
         fig2.update_xaxes(rangeslider_visible=True)
-        st.plotly_chart(fig2, width="stretch")
+        st.plotly_chart(fig2, config={"responsive": True}, width="stretch")
 
         # 2D cut: spectrum at chosen temperature (persistent selection)
         st.subheader(f"2D cut: {property_name} at a chosen temperature")
@@ -567,7 +567,7 @@ def process_and_display_spectra(file_objs, temps, options, property_name="Transm
         fig_cut = px.line(x=wl_grid_local, y=trans_cut,
                           labels={"x": "Wavelength (nm)", "y": f"{property_name}{unit_label}"},
                           title=f"{property_name} at {float(chosen_temp):.3f} °C")
-        st.plotly_chart(fig_cut, width="stretch")
+        st.plotly_chart(fig_cut, config={"responsive": True}, width="stretch")
 
         # Download selected 1D spectrum
         col_name = property_name.lower().replace(" ", "_")
