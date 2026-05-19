@@ -62,6 +62,52 @@ def extract_temp_from_filename(filename: str):
                 continue
             return val
     return None
+
+# ---------------------------
+# Helper: detect column headers (supports X, Y, thickness variants)
+# ---------------------------
+def detect_scan_column_indices(df, expected_col_count=3):
+    """
+    Detects column indices for Translation Scan data (X, Y, Thickness).
+    Supports variations like "X", "X position", "eje X", "X_position", etc.
+    If headers can't be matched, assumes order: [X, Y, Thickness]
+    Returns tuple: (x_idx, y_idx, thickness_idx) or raises ValueError.
+    """
+    if df.shape[1] < expected_col_count:
+        raise ValueError(f"Expected at least {expected_col_count} columns, found {df.shape[1]}")
+    
+    cols = [str(c).lower().strip() for c in df.columns]
+    
+    # Define patterns for each column type
+    x_patterns = [r'\bx\b', r'x[\s_-]*(position|pos|axis)', r'eje\s*x']
+    y_patterns = [r'\by\b', r'y[\s_-]*(position|pos|axis)', r'eje\s*y']
+    thickness_patterns = [r'\bthickness\b', r'espesor', r'thicknes', r'\bt\b(?!ime)', r'thick']
+    
+    x_idx, y_idx, thickness_idx = None, None, None
+    
+    # Try to match column headers
+    for i, col in enumerate(cols):
+        if x_idx is None and any(re.search(pat, col) for pat in x_patterns):
+            x_idx = i
+        elif y_idx is None and any(re.search(pat, col) for pat in y_patterns):
+            y_idx = i
+        elif thickness_idx is None and any(re.search(pat, col) for pat in thickness_patterns):
+            thickness_idx = i
+    
+    # If all found, return
+    if x_idx is not None and y_idx is not None and thickness_idx is not None:
+        return (x_idx, y_idx, thickness_idx)
+    
+    # Fallback: assume order X, Y, Thickness (first 3 columns)
+    if x_idx is None:
+        x_idx = 0
+    if y_idx is None:
+        y_idx = 1
+    if thickness_idx is None:
+        thickness_idx = 2
+    
+    return (x_idx, y_idx, thickness_idx)
+
 # ---------------------------
 # Helper: spectrum reader (robust to separators; conditional scaling to percent)
 # ---------------------------
@@ -103,6 +149,50 @@ def read_spectrum(file_like, scale_to_percent=True):
     if scale_to_percent:
         if df["prop"].max() <= 1.01:
             df["prop"] *= 100.0
+
+    return df
+
+# ---------------------------
+# Helper: read translation scan data (X, Y, Thickness)
+# ---------------------------
+def read_translation_scan(file_like):
+    """
+    Reads a three-column file (X position, Y position, Thickness).
+    Supports comma or dot as decimal separator.
+    Allows negative values for X and Y.
+    Returns dataframe with columns: X, Y, thickness
+    """
+    file_like.seek(0)
+    df = None
+    for sep in [";", ",", "\t"]:
+        try:
+            file_like.seek(0)
+            df = pd.read_csv(file_like, sep=sep, header=0)
+            if df.shape[1] >= 3:
+                break
+        except Exception:
+            file_like.seek(0)
+            continue
+
+    if df is None or df.shape[1] < 3:
+        raise ValueError("File must have at least three columns (X, Y, Thickness).")
+
+    # Detect column indices (supports various header formats)
+    x_idx, y_idx, thickness_idx = detect_scan_column_indices(df)
+    
+    df = df.iloc[:, [x_idx, y_idx, thickness_idx]].copy()
+    df.columns = ["X", "Y", "thickness"]
+    
+    # Replace decimal commas with dots
+    df = df.map(lambda x: str(x).replace(",", ".") if isinstance(x, str) else x)
+    
+    df["X"] = pd.to_numeric(df["X"], errors="coerce")
+    df["Y"] = pd.to_numeric(df["Y"], errors="coerce")
+    df["thickness"] = pd.to_numeric(df["thickness"], errors="coerce")
+    df = df.dropna()
+
+    if df.empty:
+        raise ValueError("No valid numeric data found in file.")
 
     return df
 
@@ -194,6 +284,7 @@ def expand_uploaded_to_spectra(uploaded_files, scale_to_percent=True, mode_key="
             })
 
     return entries
+
 # ---------------------------
 # Sidebar (global)
 # ---------------------------
@@ -236,7 +327,7 @@ with c1:
     st.write("Upload spectra measured at different temperatures (°C). Modes: Transmittance, Absorbance, Reflectance.")
 with c2:
     st.subheader("Ellipsometry")
-    st.write("Upload ellipsometric data (Ψ, Δ, n, k) measured at different temperatures (°C).")
+    st.write("Upload ellipsometric data (Ψ, Δ, n, k) measured at different temperatures (°C), or Translation Scan data.")
 
 if "main_mode" not in st.session_state:
     st.session_state.main_mode = "Home"
@@ -405,15 +496,10 @@ def process_and_display_spectra(file_objs, temps, options, property_name="Transm
             height=700,
         )
         
-        # ------------------------------
-        # Render plot via plotly.io.to_html (more robust) + interactive capture modal
-        # Replace previous components.html block with this
-        # ------------------------------
-        
-
+        # Render plot via plotly.io.to_html + interactive capture modal
         uid = uuid.uuid4().hex[:8]
         div_container = f"plotly-container-{mode_key}-{uid}"
-        div_query_selector = f"#{div_container} .plotly-graph-div"  # we'll search this inside the container
+        div_query_selector = f"#{div_container} .plotly-graph-div"
         modal_id = f"modal-{mode_key}-{uid}"
         btn_id = f"capture-btn-{mode_key}-{uid}"
         do_id = f"do-capture-{uid}"
@@ -422,11 +508,8 @@ def process_and_display_spectra(file_objs, temps, options, property_name="Transm
         dpi_sel = f"dpi-{uid}"
         name_input = f"name-{uid}"
 
-        # Generate the HTML fragment for the figure using Plotly's Python helper. 
-        # include_plotlyjs='cdn' so the script is loaded once inside the fragment.
         fig_html_fragment = pio.to_html(fig, include_plotlyjs='cdn', full_html=False, default_height=700)
 
-        # Wrap the fragment into a safe container and append our modal HTML + JS that finds the inner plotly div
         html = f'''
         <div id="{div_container}" style="width:100%;">{fig_html_fragment}</div>
 
@@ -468,13 +551,10 @@ def process_and_display_spectra(file_objs, temps, options, property_name="Transm
         </div>
 
         <script>
-        // small deferred init to let the plot fragment attach
         setTimeout(function(){{
         try {{
-            // find the inner plotly graph div inserted by plotly.io.to_html
             var inner = document.querySelector("{div_query_selector}");
             if (!inner) {{
-            // show diagnostic message inside container
             var cont = document.getElementById("{div_container}");
             if (cont) cont.insertAdjacentHTML('afterbegin', '<div style="color:#b00;padding:10px;">Plot element not found (Plotly may not have initialised). Open console for details.</div>');
             console.error("Plotly inner div not found: selector {div_query_selector}");
@@ -499,7 +579,6 @@ def process_and_display_spectra(file_objs, temps, options, property_name="Transm
                 var w = Math.round(inner.clientWidth * scale);
                 var h = Math.round(inner.clientHeight * scale);
 
-                // Plotly.toImage on the inner plot element captures current camera/view
                 Plotly.toImage(inner, {{format: fmt, width: w, height: h}})
                 .then(function(dataUrl) {{
                     var a = document.createElement('a');
@@ -530,10 +609,7 @@ def process_and_display_spectra(file_objs, temps, options, property_name="Transm
         </script>
         '''
 
-        # Render the combined HTML (it includes plotly.js via the fragment)
         components.html(html, height=820, scrolling=True)
-
-
 
         # 2D heatmap
         st.subheader("2D map (Wavelength vs Temperature)")
@@ -549,11 +625,9 @@ def process_and_display_spectra(file_objs, temps, options, property_name="Transm
         # 2D cut: spectrum at chosen temperature (persistent selection)
         st.subheader(f"2D cut: {property_name} at a chosen temperature")
 
-        # Initialize selected_temp if needed (mode-scoped)
         if selected_temp_key not in st.session_state:
             st.session_state[selected_temp_key] = float(temps_list_local[len(temps_list_local)//2])
 
-        # If previous selection not present, pick nearest
         if float(st.session_state[selected_temp_key]) not in [float(t) for t in temps_list_local]:
             idx_near = nearest_index(st.session_state[selected_temp_key], temps_list_local)
             st.session_state[selected_temp_key] = float(temps_list_local[idx_near])
@@ -565,7 +639,6 @@ def process_and_display_spectra(file_objs, temps, options, property_name="Transm
             key=selected_temp_key
         )
 
-        # Generate the 1D cut
         idx = nearest_index(chosen_temp, temps_list_local)
         trans_cut = Z_sorted_local[idx, :]
 
@@ -574,11 +647,231 @@ def process_and_display_spectra(file_objs, temps, options, property_name="Transm
                           title=f"{property_name} at {float(chosen_temp):.3f} °C")
         st.plotly_chart(fig_cut, config={"responsive": True, "autosizable": True})
 
-        # Download selected 1D spectrum
         col_name = property_name.lower().replace(" ", "_")
         df_cut = pd.DataFrame({"wavelength": wl_grid_local, col_name: trans_cut})
         csv_bytes = df_cut.to_csv(index=False).encode("utf-8")
         st.download_button(f"Download selected {property_name} spectrum (CSV)", data=csv_bytes, file_name=f"{col_name}_spectrum_{float(chosen_temp):.3f}C.csv", mime="text/csv")
+
+    else:
+        st.info("No processed data available. Click 'Generate 3D map' to process the uploaded files.")
+
+# ---------------------------
+# Function for Translation Scan 3D display
+# ---------------------------
+def process_and_display_translation_scan(file_objs, options, mode_key="translation_scan"):
+    """
+    Processes Translation Scan data (X, Y, Thickness) and displays 3D surface.
+    Colorscale is based on Thickness (Z values).
+    """
+    # Build signature for current inputs
+    signature = tuple((f.name,) for f in file_objs)
+
+    # Mode-scoped keys
+    force_key = f"{mode_key}_force_recompute"
+    sig_key = f"{mode_key}_scan_signature"
+    data_key = f"{mode_key}_scan_data"
+
+    gen_btn_key = f"{mode_key}_generate_btn"
+    if st.button("Generate 3D map", key=gen_btn_key):
+        st.session_state[force_key] = True
+
+    need_process = False
+    if sig_key not in st.session_state:
+        need_process = True
+    elif st.session_state.get(sig_key) != signature:
+        need_process = True
+    elif st.session_state.get(force_key, False):
+        need_process = True
+
+    if need_process:
+        st.session_state[force_key] = False
+        try:
+            # Read and validate all files
+            all_data = []
+            for f in file_objs:
+                f.seek(0)
+                df = read_translation_scan(f)
+                all_data.append(df)
+
+            # Concatenate all data
+            scan_data = pd.concat(all_data, ignore_index=True)
+            
+            if scan_data.empty:
+                st.error("No valid data found in uploaded files.")
+                return
+
+            # Store results in session_state
+            st.session_state[sig_key] = signature
+            st.session_state[data_key] = scan_data
+
+        except Exception as e:
+            st.error(f"Error processing translation scan data: {e}")
+            return
+
+    # If processed data exists, display
+    if data_key in st.session_state:
+        scan_data = st.session_state[data_key]
+
+        # 3D surface plot
+        fig = go.Figure(
+            data=[
+                go.Scatter3d(
+                    x=scan_data["X"],
+                    y=scan_data["Y"],
+                    z=scan_data["thickness"],
+                    mode='markers',
+                    marker=dict(
+                        size=6,
+                        color=scan_data["thickness"],
+                        colorscale=options.get("colorscale", colorscale_choice),
+                        showscale=True,
+                        colorbar=dict(title="Thickness (nm)"),
+                        line=dict(width=0.5, color='white')
+                    ),
+                    text=[f"X: {x:.3f} cm<br>Y: {y:.3f} cm<br>Thickness: {t:.2f} nm" 
+                          for x, y, t in zip(scan_data["X"], scan_data["Y"], scan_data["thickness"])],
+                    hovertemplate="%{text}<extra></extra>"
+                )
+            ]
+        )
+        fig.update_layout(
+            scene=dict(
+                xaxis_title="X-position (cm)",
+                yaxis_title="Y-position (cm)",
+                zaxis_title="Thickness (nm)"
+            ),
+            margin=dict(l=0, r=0, t=30, b=0),
+            height=700,
+        )
+
+        # Render plot via plotly.io.to_html + interactive capture modal
+        uid = uuid.uuid4().hex[:8]
+        div_container = f"plotly-container-{mode_key}-{uid}"
+        div_query_selector = f"#{div_container} .plotly-graph-div"
+        modal_id = f"modal-{mode_key}-{uid}"
+        btn_id = f"capture-btn-{mode_key}-{uid}"
+        do_id = f"do-capture-{uid}"
+        cancel_id = f"cancel-{uid}"
+        fmt_sel = f"fmt-{uid}"
+        dpi_sel = f"dpi-{uid}"
+        name_input = f"name-{uid}"
+
+        fig_html_fragment = pio.to_html(fig, include_plotlyjs='cdn', full_html=False, default_height=700)
+
+        html = f'''
+        <div id="{div_container}" style="width:100%;">{fig_html_fragment}</div>
+
+        <div style="margin-top:8px;">
+        <button id="{btn_id}">Capture image</button>
+        <span style="margin-left:12px;color:#666;font-size:0.95em;">Filename base: <strong>{capture_basename}_{mode_key}</strong></span>
+        </div>
+
+        <!-- Modal -->
+        <div id="{modal_id}" style="display:none; position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); z-index:10000;
+            background:#fff; border:1px solid #ccc; padding:14px; box-shadow:0 8px 24px rgba(0,0,0,0.2); min-width:320px;">
+        <div style="font-weight:600; margin-bottom:8px;">Capture options</div>
+        <div style="margin-bottom:6px;">
+            <label>Format:
+            <select id="{fmt_sel}">
+                <option>PNG</option>
+                <option>JPG</option>
+            </select>
+            </label>
+        </div>
+        <div style="margin-bottom:6px;">
+            <label>DPI:
+            <select id="{dpi_sel}">
+                <option>96</option>
+                <option>150</option>
+                <option>300</option>
+                <option>600</option>
+                <option>1200</option>
+            </select>
+            </label>
+        </div>
+        <div style="margin-bottom:8px;">
+            <label>Filename: <input id="{name_input}" style="width:60%" value="{capture_basename}_{mode_key}"/></label>
+        </div>
+        <div style="text-align:right;">
+            <button id="{do_id}">Capture</button>
+            <button id="{cancel_id}" style="margin-left:8px;">Cancel</button>
+        </div>
+        </div>
+
+        <script>
+        setTimeout(function(){{
+        try {{
+            var inner = document.querySelector("{div_query_selector}");
+            if (!inner) {{
+            var cont = document.getElementById("{div_container}");
+            if (cont) cont.insertAdjacentHTML('afterbegin', '<div style="color:#b00;padding:10px;">Plot element not found (Plotly may not have initialised). Open console for details.</div>');
+            console.error("Plotly inner div not found: selector {div_query_selector}");
+            return;
+            }}
+
+            var btn = document.getElementById("{btn_id}");
+            var modal = document.getElementById("{modal_id}");
+            var doBtn = document.getElementById("{do_id}");
+            var cancelBtn = document.getElementById("{cancel_id}");
+
+            if (btn) btn.onclick = function(){{ modal.style.display = 'block'; }};
+            if (cancelBtn) cancelBtn.onclick = function(){{ modal.style.display = 'none'; }};
+
+            if (doBtn) doBtn.onclick = function(){{
+            try {{
+                var fmt = document.getElementById("{fmt_sel}").value.toLowerCase();
+                if (fmt === 'jpg') fmt = 'jpeg';
+                var dpi = parseInt(document.getElementById("{dpi_sel}").value, 10) || 96;
+                var baseDpi = 96;
+                var scale = dpi / baseDpi;
+                var w = Math.round(inner.clientWidth * scale);
+                var h = Math.round(inner.clientHeight * scale);
+
+                Plotly.toImage(inner, {{format: fmt, width: w, height: h}})
+                .then(function(dataUrl) {{
+                    var a = document.createElement('a');
+                    a.href = dataUrl;
+                    var ext = fmt === 'jpeg' ? 'jpg' : fmt;
+                    var filename = document.getElementById("{name_input}").value || "{capture_basename}_{mode_key}";
+                    a.download = filename + "." + ext;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    modal.style.display = 'none';
+                }})
+                .catch(function(err) {{
+                    alert('Could not generate image: ' + err);
+                    console.error("Plotly.toImage error:", err);
+                    modal.style.display = 'none';
+                }});
+            }} catch (err) {{
+                alert('Capture error: ' + err);
+                console.error("Capture exception:", err);
+                modal.style.display = 'none';
+            }}
+            }};
+        }} catch (e) {{
+            console.error("Initialization error for capture UI:", e);
+        }}
+        }}, 80);
+        </script>
+        '''
+
+        components.html(html, height=820, scrolling=True)
+
+        # Summary statistics
+        st.subheader("Data Summary")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("X range (cm)", f"{scan_data['X'].min():.3f} to {scan_data['X'].max():.3f}")
+        with col2:
+            st.metric("Y range (cm)", f"{scan_data['Y'].min():.3f} to {scan_data['Y'].max():.3f}")
+        with col3:
+            st.metric("Thickness range (nm)", f"{scan_data['thickness'].min():.2f} to {scan_data['thickness'].max():.2f}")
+
+        # Download data as CSV
+        csv_bytes = scan_data.to_csv(index=False).encode("utf-8")
+        st.download_button("Download processed data (CSV)", data=csv_bytes, file_name="translation_scan_data.csv", mime="text/csv")
 
     else:
         st.info("No processed data available. Click 'Generate 3D map' to process the uploaded files.")
@@ -599,18 +892,15 @@ elif main_mode == "Spectroscopy":
     st.header("Spectroscopy")
     st.markdown("Modes: Transmittance, Absorbance, Reflectance")
 
-    # Ensure default in session_state BEFORE creating the widget
     if "spectro_submode" not in st.session_state:
         st.session_state["spectro_submode"] = "Transmittance"
 
-    # Create the selectbox bound to session_state (do NOT assign session_state after this)
     spectro_submode = st.selectbox(
         "Select spectroscopy mode",
         options=["Transmittance", "Absorbance", "Reflectance"],
         key="spectro_submode"
     )
 
-    # --- Upload block (Spectroscopy) with multi-column support ---
     uploaded = st.file_uploader(
         "Upload spectrum files (CSV/TXT/DAT). One file = one temperature, or a single file with multiple property columns (first column = wavelength).",
         accept_multiple_files=True,
@@ -620,7 +910,6 @@ elif main_mode == "Spectroscopy":
 
     if uploaded:
         mode_key = "spectroscopy"
-        # expand single multi-col files into per-column in-memory two-column files
         entries = expand_uploaded_to_spectra(uploaded, scale_to_percent=True, mode_key=mode_key)
 
         if not entries:
@@ -651,7 +940,6 @@ elif main_mode == "Spectroscopy":
             options = {"resolution": resolution, "use_overlap": use_overlap, "apply_smooth": apply_smooth,
                     "window": window, "poly": poly, "colorscale": colorscale_choice}
 
-            # property_name for spectroscopy: use spectro_submode (Transmittance/Absorbance/Reflectance)
             process_and_display_spectra(
                 file_objs,
                 temps,
@@ -667,77 +955,100 @@ elif main_mode == "Spectroscopy":
 # ELLIPSOMETRY
 elif main_mode == "Ellipsometry":
     st.header("Ellipsometry")
-    st.markdown("Modes: Ψ, Δ, n (refractive index), k (extinction coefficient)")
+    st.markdown("Modes: Ψ, Δ, n (refractive index), k (extinction coefficient), Translation Scan")
 
     # Display → internal mapping
     ellip_map = {
         "Ψ": "Psi",
         "Δ": "Delta",
         "n": "n",
-        "k": "k"
+        "k": "k",
+        "Translation Scan": "translation_scan"
     }
 
-    # Ensure default in session_state BEFORE creating the widget
     if "ellip_submode" not in st.session_state:
-        st.session_state["ellip_submode"] = "Ψ"  # default symbol
+        st.session_state["ellip_submode"] = "Ψ"
 
-    # Create the selectbox with greek symbols for display
     ellip_submode_display = st.selectbox(
         "Select ellipsometry mode",
         options=list(ellip_map.keys()),
         key="ellip_submode"
     )
-    ellip_submode_internal = ellip_map[ellip_submode_display]  # internal if needed
+    ellip_submode_internal = ellip_map[ellip_submode_display]
 
-    # --- Upload block (Ellipsometry) with multi-column support ---
-    uploaded = st.file_uploader(
-        "Upload ellipsometry files (CSV/TXT/DAT). One file = one temperature, or a single file with multiple property columns (first column = wavelength).",
-        accept_multiple_files=True,
-        type=["csv", "txt", "dat"],
-        key="ellip_uploader"
-    )
+    # Translation Scan mode
+    if ellip_submode_display == "Translation Scan":
+        st.markdown("Upload translation scan data with three columns: X position, Y position, and Thickness. Supports various column header formats (X, Y, Thickness or variations like 'X position', 'eje X', etc.).")
+        
+        uploaded = st.file_uploader(
+            "Upload translation scan files (CSV/TXT/DAT). Each file should contain three columns: X, Y, Thickness.",
+            accept_multiple_files=True,
+            type=["csv", "txt", "dat"],
+            key="translation_uploader"
+        )
 
-    if uploaded:
-        mode_key = "ellipsometry"
-        # expand; ellipsometry accepts any numeric range, so scale_to_percent=False
-        entries = expand_uploaded_to_spectra(uploaded, scale_to_percent=False, mode_key=mode_key)
+        if uploaded:
+            mode_key = "translation_scan"
+            file_objs = list(uploaded)
 
-        if not entries:
-            st.info("No valid spectra found in uploaded files.")
-        else:
-            st.markdown("**Detected ellipsometry spectra. Edit temperatures if needed:**")
-            cols = st.columns(2)
-            file_objs = []
-            temps = []
-            for i, e in enumerate(entries):
-                col = cols[i % 2]
-                col.write(f"**{e['label']}**")
-                if e["temp_key"] not in st.session_state:
-                    if e["temp_default"] is not None:
-                        st.session_state[e["temp_key"]] = float(e["temp_default"])
-                    else:
-                        st.session_state[e["temp_key"]] = 25.0
-                temp_val = col.number_input(
-                    f"Temperature for {e['label']}",
-                    step=0.1,
-                    format="%.3f",
-                    key=e["temp_key"]
-                )
-
-                file_objs.append(e["fileobj"])
-                temps.append(float(temp_val))
-
-            options = {"resolution": resolution, "use_overlap": use_overlap, "apply_smooth": apply_smooth,
-                    "window": window, "poly": poly, "colorscale": colorscale_choice}
-
-            # property_name for ellipsometry: pass the displayed name (Ψ, Δ, n, k) so labels show greeks
-            process_and_display_spectra(
+            options = {"colorscale": colorscale_choice}
+            
+            process_and_display_translation_scan(
                 file_objs,
-                temps,
                 options,
-                property_name=ellip_submode_display,
-                mode_key=mode_key,
-                is_percent=False
+                mode_key=mode_key
             )
+        else:
+            st.info("Upload files to enable processing.")
+
+    # Standard ellipsometry modes (Ψ, Δ, n, k)
     else:
-        st.info("Upload files to enable processing.")
+        uploaded = st.file_uploader(
+            "Upload ellipsometry files (CSV/TXT/DAT). One file = one temperature, or a single file with multiple property columns (first column = wavelength).",
+            accept_multiple_files=True,
+            type=["csv", "txt", "dat"],
+            key="ellip_uploader"
+        )
+
+        if uploaded:
+            mode_key = "ellipsometry"
+            entries = expand_uploaded_to_spectra(uploaded, scale_to_percent=False, mode_key=mode_key)
+
+            if not entries:
+                st.info("No valid spectra found in uploaded files.")
+            else:
+                st.markdown("**Detected ellipsometry spectra. Edit temperatures if needed:**")
+                cols = st.columns(2)
+                file_objs = []
+                temps = []
+                for i, e in enumerate(entries):
+                    col = cols[i % 2]
+                    col.write(f"**{e['label']}**")
+                    if e["temp_key"] not in st.session_state:
+                        if e["temp_default"] is not None:
+                            st.session_state[e["temp_key"]] = float(e["temp_default"])
+                        else:
+                            st.session_state[e["temp_key"]] = 25.0
+                    temp_val = col.number_input(
+                        f"Temperature for {e['label']}",
+                        step=0.1,
+                        format="%.3f",
+                        key=e["temp_key"]
+                    )
+
+                    file_objs.append(e["fileobj"])
+                    temps.append(float(temp_val))
+
+                options = {"resolution": resolution, "use_overlap": use_overlap, "apply_smooth": apply_smooth,
+                        "window": window, "poly": poly, "colorscale": colorscale_choice}
+
+                process_and_display_spectra(
+                    file_objs,
+                    temps,
+                    options,
+                    property_name=ellip_submode_display,
+                    mode_key=mode_key,
+                    is_percent=False
+                )
+        else:
+            st.info("Upload files to enable processing.")
