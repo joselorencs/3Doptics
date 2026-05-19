@@ -226,7 +226,7 @@ st.sidebar.markdown('[💼 LinkedIn](https://www.linkedin.com/in/jos%C3%A9-loren
 # ---------------------------
 st.title("3D OPTICS")
 st.markdown("Interactive 3D viewer for **Spectroscopy** and **Ellipsometry** datasets as a function of temperature.")
-st.markdown("You can upload **multiple two-column files** (wavelength (nm) and optical property) registered at different temperatures or **one file with more than two columns** (the first one for wavelength and the rest for the optical property values recorded at different temperatures).")
+st.markdown("You can upload **multiple two-column files** (wavelength (nm) and optical property) registered at different temperatures or **one file with more than two columns** (the first one for wavelength).")
 st.markdown("""
 **CHOOSE A WORKING MODE** BELOW TO START:
 """)
@@ -380,17 +380,22 @@ def process_and_display_spectra(file_objs, temps, options, property_name="Transm
         Z_sorted_local = st.session_state[Z_key]
         temps_list_local = st.session_state[temps_key]
 
-        # 3D surface
+        # 3D surface with temperature as colorscale
         WL_mesh, T_mesh = np.meshgrid(wl_grid_local, np.array(temps_list_local, dtype=float))
+        
+        # Create a colorscale array based on temperature values
+        colorscale_array = np.array(temps_list_local, dtype=float)
+        
         fig = go.Figure(
             data=[
                 go.Surface(
                     x=WL_mesh,
                     y=T_mesh,
                     z=Z_sorted_local,
+                    surfacecolor=colorscale_array[:, None] * np.ones_like(wl_grid_local),
                     colorscale=options.get("colorscale", colorscale_choice),
-                    colorbar=dict(title=f"{property_name}{unit_label}"),
-                    hovertemplate=f"λ=%{{x:.1f}} nm<br>T=%{{y:.3f}}<br>{property_name}=%{{z:.2f}}{unit_label}"
+                    colorbar=dict(title="Temperature (°C)"),
+                    hovertemplate=f"λ=%{{x:.1f}} nm<br>T=%{{y:.3f}} °C<br>{property_name}=%{{z:.2f}}{unit_label}"
                 )
             ]
         )
