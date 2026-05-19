@@ -90,7 +90,7 @@ def read_spectrum(file_like, scale_to_percent=True):
     df.columns = ["wavelength", "prop"]
     df = df.dropna().sort_values("wavelength")
 
-    df = df.applymap(lambda x: str(x).replace(",", ".") if isinstance(x, str) else x)
+    df = df.map(lambda x: str(x).replace(",", ".") if isinstance(x, str) else x)
 
     df["wavelength"] = pd.to_numeric(df["wavelength"], errors="coerce")
     df["prop"] = pd.to_numeric(df["prop"], errors="coerce")
@@ -149,7 +149,7 @@ def expand_uploaded_to_spectra(uploaded_files, scale_to_percent=True, mode_key="
             continue
 
         # Replace decimal commas with dots
-        df_raw = df_raw.applymap(lambda x: str(x).replace(",", ".") if isinstance(x, str) else x)
+        df_raw = df_raw.map(lambda x: str(x).replace(",", ".") if isinstance(x, str) else x)
 
         wl = pd.to_numeric(df_raw.iloc[:, 0], errors="coerce")
         if wl.dropna().empty:
