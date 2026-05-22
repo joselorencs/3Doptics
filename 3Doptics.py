@@ -65,14 +65,15 @@ def extract_temp_from_filename(filename: str):
     return None
 
 # ---------------------------
-# Helper: detect column headers (supports X, Y, thickness variants)
+# Helper: detect column headers (supports X, Y, thickness/Psi/n variants)
 # ---------------------------
 def detect_scan_column_indices(df, expected_col_count=3):
     """
-    Detects column indices for Translation Scan data (X, Y, Thickness).
+    Detects column indices for Translation Scan data (X, Y, and a 3rd property).
+    The 3rd property can be: Thickness, Psi, or n.
     Supports variations like "X", "X position", "eje X", "X_position", etc.
-    If headers can't be matched, assumes order: [X, Y, Thickness]
-    Returns tuple: (x_idx, y_idx, thickness_idx) or raises ValueError.
+    If headers can't be matched, assumes order: [X, Y, Property]
+    Returns tuple: (x_idx, y_idx, property_idx, property_name) where property_name is 'thickness', 'psi', or 'n'.
     """
     if df.shape[1] < expected_col_count:
         raise ValueError(f"Expected at least {expected_col_count} columns, found {df.shape[1]}")
@@ -83,8 +84,11 @@ def detect_scan_column_indices(df, expected_col_count=3):
     x_patterns = [r'\bx\b', r'x[\s_-]*(position|pos|axis)', r'eje\s*x']
     y_patterns = [r'\by\b', r'y[\s_-]*(position|pos|axis)', r'eje\s*y']
     thickness_patterns = [r'\bthickness\b', r'espesor', r'thicknes', r'\bt\b(?!ime)', r'thick']
+    psi_patterns = [r'\bpsi\b', r'ψ']
+    n_patterns = [r'\bn\b', r'n[\s_-]*(refractive|index|ri)', r'refractive[\s_-]*index']
     
-    x_idx, y_idx, thickness_idx = None, None, None
+    x_idx, y_idx, property_idx = None, None, None
+    property_name = 'thickness'  # default
     
     # Try to match column headers
     for i, col in enumerate(cols):
@@ -92,22 +96,31 @@ def detect_scan_column_indices(df, expected_col_count=3):
             x_idx = i
         elif y_idx is None and any(re.search(pat, col) for pat in y_patterns):
             y_idx = i
-        elif thickness_idx is None and any(re.search(pat, col) for pat in thickness_patterns):
-            thickness_idx = i
+        elif property_idx is None:
+            # Check for specific property types
+            if any(re.search(pat, col) for pat in psi_patterns):
+                property_idx = i
+                property_name = 'psi'
+            elif any(re.search(pat, col) for pat in n_patterns):
+                property_idx = i
+                property_name = 'n'
+            elif any(re.search(pat, col) for pat in thickness_patterns):
+                property_idx = i
+                property_name = 'thickness'
     
     # If all found, return
-    if x_idx is not None and y_idx is not None and thickness_idx is not None:
-        return (x_idx, y_idx, thickness_idx)
+    if x_idx is not None and y_idx is not None and property_idx is not None:
+        return (x_idx, y_idx, property_idx, property_name)
     
-    # Fallback: assume order X, Y, Thickness (first 3 columns)
+    # Fallback: assume order X, Y, Property (first 3 columns)
     if x_idx is None:
         x_idx = 0
     if y_idx is None:
         y_idx = 1
-    if thickness_idx is None:
-        thickness_idx = 2
+    if property_idx is None:
+        property_idx = 2
     
-    return (x_idx, y_idx, thickness_idx)
+    return (x_idx, y_idx, property_idx, property_name)
 
 # ---------------------------
 # Helper: spectrum reader (robust to separators; conditional scaling to percent)
@@ -154,14 +167,15 @@ def read_spectrum(file_like, scale_to_percent=True):
     return df
 
 # ---------------------------
-# Helper: read translation scan data (X, Y, Thickness)
+# Helper: read translation scan data (X, Y, and Property: Thickness/Psi/n)
 # ---------------------------
 def read_translation_scan(file_like):
     """
-    Reads a three-column file (X position, Y position, Thickness).
+    Reads a three-column file (X position, Y position, and a 3rd property).
+    The 3rd property can be: Thickness (nm), Psi (°), or n (refractive index).
     Supports comma or dot as decimal separator.
     Allows negative values for X and Y.
-    Returns dataframe with columns: X, Y, thickness
+    Returns dataframe with columns: X, Y, and property_value (plus property_name attribute).
     """
     file_like.seek(0)
     df = None
@@ -176,24 +190,27 @@ def read_translation_scan(file_like):
             continue
 
     if df is None or df.shape[1] < 3:
-        raise ValueError("File must have at least three columns (X, Y, Thickness).")
+        raise ValueError("File must have at least three columns (X, Y, Property).")
 
-    # Detect column indices (supports various header formats)
-    x_idx, y_idx, thickness_idx = detect_scan_column_indices(df)
+    # Detect column indices and property type
+    x_idx, y_idx, property_idx, property_name = detect_scan_column_indices(df)
     
-    df = df.iloc[:, [x_idx, y_idx, thickness_idx]].copy()
-    df.columns = ["X", "Y", "thickness"]
+    df = df.iloc[:, [x_idx, y_idx, property_idx]].copy()
+    df.columns = ["X", "Y", "property"]
     
     # Replace decimal commas with dots
     df = df.map(lambda x: str(x).replace(",", ".") if isinstance(x, str) else x)
     
     df["X"] = pd.to_numeric(df["X"], errors="coerce")
     df["Y"] = pd.to_numeric(df["Y"], errors="coerce")
-    df["thickness"] = pd.to_numeric(df["thickness"], errors="coerce")
+    df["property"] = pd.to_numeric(df["property"], errors="coerce")
     df = df.dropna()
 
     if df.empty:
         raise ValueError("No valid numeric data found in file.")
+
+    # Store property_name as an attribute
+    df.property_name = property_name
 
     return df
 
@@ -662,8 +679,8 @@ def process_and_display_spectra(file_objs, temps, options, property_name="Transm
 # ---------------------------
 def process_and_display_translation_scan(file_objs, options, mode_key="translation_scan"):
     """
-    Processes Translation Scan data (X, Y, Thickness) and displays 3D surface.
-    Colorscale is based on Thickness (Z values).
+    Processes Translation Scan data (X, Y, and Property: Thickness/Psi/n) and displays 3D surface.
+    Colorscale is based on the Property values (Thickness, Psi, or n).
     Interpolates data to create a smooth surface using cubic interpolation.
     """
     # Build signature for current inputs
@@ -691,10 +708,12 @@ def process_and_display_translation_scan(file_objs, options, mode_key="translati
         try:
             # Read and validate all files
             all_data = []
+            property_types = []
             for f in file_objs:
                 f.seek(0)
                 df = read_translation_scan(f)
                 all_data.append(df)
+                property_types.append(df.property_name)
 
             # Concatenate all data
             scan_data = pd.concat(all_data, ignore_index=True)
@@ -703,9 +722,13 @@ def process_and_display_translation_scan(file_objs, options, mode_key="translati
                 st.error("No valid data found in uploaded files.")
                 return
 
+            # Determine the property type (use the most common one if mixed)
+            property_name = max(set(property_types), key=property_types.count)
+            
             # Store results in session_state
             st.session_state[sig_key] = signature
             st.session_state[data_key] = scan_data
+            st.session_state[f"{mode_key}_property_name"] = property_name
 
         except Exception as e:
             st.error(f"Error processing translation scan data: {e}")
@@ -714,11 +737,26 @@ def process_and_display_translation_scan(file_objs, options, mode_key="translati
     # If processed data exists, display
     if data_key in st.session_state:
         scan_data = st.session_state[data_key]
+        property_name = st.session_state.get(f"{mode_key}_property_name", "thickness")
+
+        # Determine units and labels based on property type
+        if property_name == "psi":
+            property_label = "Psi"
+            unit_label = " (°)"
+            color_label = "Psi (°)"
+        elif property_name == "n":
+            property_label = "n"
+            unit_label = ""
+            color_label = "Refractive Index"
+        else:  # thickness
+            property_label = "Thickness"
+            unit_label = " (nm)"
+            color_label = "Thickness (nm)"
 
         # Create interpolated surface using griddata
         x_pts = scan_data["X"].values
         y_pts = scan_data["Y"].values
-        z_pts = scan_data["thickness"].values
+        z_pts = scan_data["property"].values
         
         # Create a regular grid for interpolation
         x_min, x_max = x_pts.min(), x_pts.max()
@@ -729,7 +767,7 @@ def process_and_display_translation_scan(file_objs, options, mode_key="translati
         yi = np.linspace(y_min, y_max, 50)
         XI, YI = np.meshgrid(xi, yi)
         
-        # Interpolate thickness values on the grid using cubic interpolation
+        # Interpolate property values on the grid using cubic interpolation
         points = np.column_stack([x_pts, y_pts])
         ZI = griddata(points, z_pts, (XI, YI), method='cubic', fill_value=np.mean(z_pts))
         
@@ -742,8 +780,8 @@ def process_and_display_translation_scan(file_objs, options, mode_key="translati
                     z=ZI,
                     surfacecolor=ZI,
                     colorscale=options.get("colorscale", "Viridis"),
-                    colorbar=dict(title="Thickness (nm)"),
-                    hovertemplate="X: %{x:.3f} cm<br>Y: %{y:.3f} cm<br>Thickness: %{z:.2f} nm<extra></extra>"
+                    colorbar=dict(title=color_label),
+                    hovertemplate="X: %{x:.3f} cm<br>Y: %{y:.3f} cm<br>" + property_label + ": %{z:.2f}" + unit_label + "<extra></extra>"
                 )
             ]
         )
@@ -751,7 +789,7 @@ def process_and_display_translation_scan(file_objs, options, mode_key="translati
             scene=dict(
                 xaxis_title="X-position (cm)",
                 yaxis_title="Y-position (cm)",
-                zaxis_title="Thickness (nm)"
+                zaxis_title=f"{property_label}{unit_label}"
             ),
             margin=dict(l=0, r=0, t=30, b=0),
             height=700,
@@ -880,7 +918,7 @@ def process_and_display_translation_scan(file_objs, options, mode_key="translati
         with col2:
             st.metric("Y range (cm)", f"{scan_data['Y'].min():.3f} to {scan_data['Y'].max():.3f}")
         with col3:
-            st.metric("Thickness range (nm)", f"{scan_data['thickness'].min():.2f} to {scan_data['thickness'].max():.2f}")
+            st.metric(f"{property_label} range{unit_label}", f"{scan_data['property'].min():.2f} to {scan_data['property'].max():.2f}")
 
         # Download data as CSV
         csv_bytes = scan_data.to_csv(index=False).encode("utf-8")
@@ -991,10 +1029,10 @@ elif main_mode == "Ellipsometry":
 
     # Translation Scan mode
     if ellip_submode_display == "Translation Scan":
-        st.markdown("Upload translation scan data with three columns: X position, Y position, and Thickness. Supports various column header formats (X, Y, Thickness or variations like 'X position', 'eje X', etc.).")
+        st.markdown("Upload translation scan data with three columns: X position, Y position, and Property (Thickness, Psi, or n). Supports various column header formats.")
         
         uploaded = st.file_uploader(
-            "Upload translation scan files (CSV/TXT/DAT). Each file should contain three columns: X, Y, Thickness.",
+            "Upload translation scan files (CSV/TXT/DAT). Each file should contain three columns: X, Y, and Property (Thickness/Psi/n).",
             accept_multiple_files=True,
             type=["csv", "txt", "dat"],
             key="translation_uploader"
