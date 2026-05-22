@@ -123,26 +123,52 @@ def detect_scan_column_indices(df, expected_col_count=3):
     return (x_idx, y_idx, property_idx, property_name)
 
 # ---------------------------
-# Helper: spectrum reader (robust to separators; conditional scaling to percent)
+# Helper: read file as dataframe (supports CSV, TXT, DAT, XLSX)
 # ---------------------------
-def read_spectrum(file_like, scale_to_percent=True):
+def read_file_to_dataframe(file_like, filename):
     """
-    Reads a two-column file (wavelength, property).
-    If scale_to_percent==True and values are in [0,1], multiply by 100.
-    Returns dataframe with columns: wavelength, prop
+    Reads various file formats (CSV, TXT, DAT, XLSX) and returns a dataframe.
+    Supports multiple separators for text files.
     """
-    file_like.seek(0)
+    # Check file extension
+    file_ext = os.path.splitext(filename)[1].lower()
+    
+    # Try Excel format first if .xlsx
+    if file_ext == '.xlsx':
+        try:
+            file_like.seek(0)
+            df = pd.read_excel(file_like, header=0)
+            if df.shape[1] >= 2:
+                return df
+        except Exception as e:
+            st.warning(f"Could not read **{filename}** as Excel file: {e}")
+            return None
+    
+    # Try CSV/TXT format with various separators
     df = None
     for sep in [";", ",", "\t"]:
         try:
             file_like.seek(0)
             df = pd.read_csv(file_like, sep=sep, header=0)
             if df.shape[1] >= 2:
-                break
+                return df
         except Exception:
             file_like.seek(0)
             continue
+    
+    return None
 
+# ---------------------------
+# Helper: spectrum reader (robust to separators; conditional scaling to percent)
+# ---------------------------
+def read_spectrum(file_like, filename, scale_to_percent=True):
+    """
+    Reads a two-column file (wavelength, property) from CSV/TXT/XLSX formats.
+    If scale_to_percent==True and values are in [0,1], multiply by 100.
+    Returns dataframe with columns: wavelength, prop
+    """
+    df = read_file_to_dataframe(file_like, filename)
+    
     if df is None or df.shape[1] < 2:
         raise ValueError("File must have two columns (wavelength and property).")
 
@@ -169,26 +195,16 @@ def read_spectrum(file_like, scale_to_percent=True):
 # ---------------------------
 # Helper: read translation scan data (X, Y, and Property: Thickness/Psi/n)
 # ---------------------------
-def read_translation_scan(file_like):
+def read_translation_scan(file_like, filename):
     """
     Reads a three-column file (X position, Y position, and a 3rd property).
     The 3rd property can be: Thickness (nm), Psi (°), or n (refractive index).
-    Supports comma or dot as decimal separator.
+    Supports CSV/TXT/XLSX formats with various separators and comma/dot decimals.
     Allows negative values for X and Y.
     Returns dataframe with columns: X, Y, and property_value (plus property_name attribute).
     """
-    file_like.seek(0)
-    df = None
-    for sep in [";", ",", "\t"]:
-        try:
-            file_like.seek(0)
-            df = pd.read_csv(file_like, sep=sep, header=0)
-            if df.shape[1] >= 3:
-                break
-        except Exception:
-            file_like.seek(0)
-            continue
-
+    df = read_file_to_dataframe(file_like, filename)
+    
     if df is None or df.shape[1] < 3:
         raise ValueError("File must have at least three columns (X, Y, Property).")
 
@@ -219,7 +235,7 @@ def read_translation_scan(file_like):
 # ---------------------------
 def expand_uploaded_to_spectra(uploaded_files, scale_to_percent=True, mode_key="spectroscopy"):
     """
-    Accepts multiple uploaded files.
+    Accepts multiple uploaded files (CSV, TXT, DAT, XLSX).
     Each file can contain:
       - Two columns (wavelength, property)  → one spectrum
       - One wavelength + multiple property columns → multiple spectra from same file
@@ -235,71 +251,62 @@ def expand_uploaded_to_spectra(uploaded_files, scale_to_percent=True, mode_key="
     idx_global = 0
 
     for up in uploaded_files:
-        # Read full text once
         try:
-            text = up.getvalue().decode("utf-8", errors="ignore")
-        except Exception:
-            text = up.read().decode("utf-8", errors="ignore")
-
-        # Try various separators
-        df_raw = None
-        for sep in [";", ",", "\t"]:
-            try:
-                df_try = pd.read_csv(io.StringIO(text), sep=sep, header=0)
-                if df_try.shape[1] >= 2:
-                    df_raw = df_try
-                    break
-            except Exception:
+            # Read file to dataframe
+            df_raw = read_file_to_dataframe(up, up.name)
+            
+            if df_raw is None or df_raw.shape[1] < 2:
+                st.warning(f"File **{up.name}** must have at least two columns (wavelength + property). Skipping.")
                 continue
 
-        if df_raw is None or df_raw.shape[1] < 2:
-            st.warning(f"File **{up.name}** must have at least two columns (wavelength + property). Skipping.")
+            # Replace decimal commas with dots
+            df_raw = df_raw.map(lambda x: str(x).replace(",", ".") if isinstance(x, str) else x)
+
+            wl = pd.to_numeric(df_raw.iloc[:, 0], errors="coerce")
+            if wl.dropna().empty:
+                st.warning(f"Could not parse wavelength column in file **{up.name}**. Skipping file.")
+                continue
+
+            # Process each property column
+            for j in range(1, df_raw.shape[1]):
+                col_series = pd.to_numeric(df_raw.iloc[:, j], errors="coerce")
+                if col_series.dropna().empty:
+                    continue
+
+                df_two = pd.DataFrame({"wavelength": wl, "prop": col_series}).dropna().sort_values("wavelength")
+                if df_two.empty:
+                    continue
+
+                if scale_to_percent and df_two["prop"].max() <= 1.01:
+                    df_two["prop"] *= 100.0
+
+                col_label = str(df_raw.columns[j])
+                temp_guess = None
+                parsed_from_col = extract_temp_from_filename(col_label)
+                if parsed_from_col is not None:
+                    temp_guess = float(parsed_from_col)
+                else:
+                    parsed_from_name = extract_temp_from_filename(up.name)
+                    if parsed_from_name is not None:
+                        temp_guess = float(parsed_from_name)
+
+                csv_text = df_two.to_csv(index=False)
+                synthetic_name = f"{up.name}__col{j}__{col_label}"
+                memfile = InMemoryFile(csv_text, synthetic_name)
+
+                temp_key = f"{mode_key}_temp_{idx_global}"
+                idx_global += 1
+
+                entries.append({
+                    "fileobj": memfile,
+                    "label": f"{up.name} — column: {col_label}",
+                    "temp_key": temp_key,
+                    "temp_default": float(temp_guess) if temp_guess is not None else None
+                })
+        
+        except Exception as e:
+            st.warning(f"Error processing file **{up.name}**: {e}")
             continue
-
-        # Replace decimal commas with dots
-        df_raw = df_raw.map(lambda x: str(x).replace(",", ".") if isinstance(x, str) else x)
-
-        wl = pd.to_numeric(df_raw.iloc[:, 0], errors="coerce")
-        if wl.dropna().empty:
-            st.warning(f"Could not parse wavelength column in file **{up.name}**. Skipping file.")
-            continue
-
-        # Process each property column
-        for j in range(1, df_raw.shape[1]):
-            col_series = pd.to_numeric(df_raw.iloc[:, j], errors="coerce")
-            if col_series.dropna().empty:
-                continue
-
-            df_two = pd.DataFrame({"wavelength": wl, "prop": col_series}).dropna().sort_values("wavelength")
-            if df_two.empty:
-                continue
-
-            if scale_to_percent and df_two["prop"].max() <= 1.01:
-                df_two["prop"] *= 100.0
-
-            col_label = str(df_raw.columns[j])
-            temp_guess = None
-            parsed_from_col = extract_temp_from_filename(col_label)
-            if parsed_from_col is not None:
-                temp_guess = float(parsed_from_col)
-            else:
-                parsed_from_name = extract_temp_from_filename(up.name)
-                if parsed_from_name is not None:
-                    temp_guess = float(parsed_from_name)
-
-            csv_text = df_two.to_csv(index=False)
-            synthetic_name = f"{up.name}__col{j}__{col_label}"
-            memfile = InMemoryFile(csv_text, synthetic_name)
-
-            temp_key = f"{mode_key}_temp_{idx_global}"
-            idx_global += 1
-
-            entries.append({
-                "fileobj": memfile,
-                "label": f"{up.name} — column: {col_label}",
-                "temp_key": temp_key,
-                "temp_default": float(temp_guess) if temp_guess is not None else None
-            })
 
     return entries
 
@@ -311,7 +318,7 @@ st.sidebar.markdown("Global settings for processing and display")
 
 resolution = st.sidebar.slider("Wavelength grid resolution", 200, 4000, 1000, step=100)
 use_overlap = st.sidebar.checkbox("Use overlapped wavelength range (recommended)", value=True)
-apply_smooth = st.sidebar.checkbox("Apply Savitzky–Golay smoothing (optional)", value=False)
+apply_smooth = st.sidebar.checkbox("Apply Savitzky–Goyal smoothing (optional)", value=False)
 if apply_smooth:
     window = st.sidebar.slider("S-G window length (odd)", 5, 101, 11, step=2)
     poly = st.sidebar.slider("S-G polynomial order", 1, 5, 3)
@@ -413,7 +420,7 @@ def process_and_display_spectra(file_objs, temps, options, property_name="Transm
             wl_maxs = []
             for f in file_objs:
                 f.seek(0)
-                df = read_spectrum(f, scale_to_percent=is_percent)
+                df = read_spectrum(f, f.name, scale_to_percent=is_percent)
                 # For spectroscopic percent properties, warn if outside 0-100
                 if is_percent:
                     if (df["prop"].min() < -1e-6) or (df["prop"].max() > 100.0001):
@@ -711,7 +718,7 @@ def process_and_display_translation_scan(file_objs, options, mode_key="translati
             property_types = []
             for f in file_objs:
                 f.seek(0)
-                df = read_translation_scan(f)
+                df = read_translation_scan(f, f.name)
                 all_data.append(df)
                 property_types.append(df.property_name)
 
@@ -953,9 +960,9 @@ elif main_mode == "Spectroscopy":
     )
 
     uploaded = st.file_uploader(
-        "Upload spectrum files (CSV/TXT/DAT). One file = one temperature, or a single file with multiple property columns (first column = wavelength).",
+        "Upload spectrum files (CSV/TXT/DAT/XLSX). One file = one temperature, or a single file with multiple property columns (first column = wavelength).",
         accept_multiple_files=True,
-        type=["csv", "txt", "dat"],
+        type=["csv", "txt", "dat", "xlsx"],
         key="spectro_uploader"
     )
 
@@ -1029,12 +1036,12 @@ elif main_mode == "Ellipsometry":
 
     # Translation Scan mode
     if ellip_submode_display == "Translation Scan":
-        st.markdown("Upload translation scan data with three columns: X position, Y position, and Property (Thickness, Psi, or n). Supports various column header formats.")
+        st.markdown("Upload translation scan data with three columns: X position, Y position, and Property (Thickness, Psi, or n). Supports various column header formats and file types (CSV/TXT/DAT/XLSX).")
         
         uploaded = st.file_uploader(
-            "Upload translation scan files (CSV/TXT/DAT). Each file should contain three columns: X, Y, and Property (Thickness/Psi/n).",
+            "Upload translation scan files (CSV/TXT/DAT/XLSX). Each file should contain three columns: X, Y, and Property (Thickness/Psi/n).",
             accept_multiple_files=True,
-            type=["csv", "txt", "dat"],
+            type=["csv", "txt", "dat", "xlsx"],
             key="translation_uploader"
         )
 
@@ -1055,9 +1062,9 @@ elif main_mode == "Ellipsometry":
     # Standard ellipsometry modes (Ψ, Δ, n, k)
     else:
         uploaded = st.file_uploader(
-            "Upload ellipsometry files (CSV/TXT/DAT). One file = one temperature, or a single file with multiple property columns (first column = wavelength).",
+            "Upload ellipsometry files (CSV/TXT/DAT/XLSX). One file = one temperature, or a single file with multiple property columns (first column = wavelength).",
             accept_multiple_files=True,
-            type=["csv", "txt", "dat"],
+            type=["csv", "txt", "dat", "xlsx"],
             key="ellip_uploader"
         )
 
