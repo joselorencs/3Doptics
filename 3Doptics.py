@@ -697,6 +697,8 @@ def process_and_display_translation_scan(file_objs, options, mode_key="translati
     force_key = f"{mode_key}_force_recompute"
     sig_key = f"{mode_key}_scan_signature"
     data_key = f"{mode_key}_scan_data"
+    colorscale_min_key = f"{mode_key}_colorscale_min"
+    colorscale_max_key = f"{mode_key}_colorscale_max"
 
     gen_btn_key = f"{mode_key}_generate_btn"
     if st.button("Generate 3D map", key=gen_btn_key):
@@ -736,6 +738,12 @@ def process_and_display_translation_scan(file_objs, options, mode_key="translati
             st.session_state[sig_key] = signature
             st.session_state[data_key] = scan_data
             st.session_state[f"{mode_key}_property_name"] = property_name
+            
+            # Initialize colorscale min/max with data range
+            if colorscale_min_key not in st.session_state:
+                st.session_state[colorscale_min_key] = float(scan_data["property"].min())
+            if colorscale_max_key not in st.session_state:
+                st.session_state[colorscale_max_key] = float(scan_data["property"].max())
 
         except Exception as e:
             st.error(f"Error processing translation scan data: {e}")
@@ -760,10 +768,45 @@ def process_and_display_translation_scan(file_objs, options, mode_key="translati
             unit_label = " (nm)"
             color_label = "Thickness (nm)"
 
+        # Color scale range controls
+        st.subheader("Color Scale Range")
+        col_min, col_max = st.columns(2)
+        
+        data_min = float(scan_data["property"].min())
+        data_max = float(scan_data["property"].max())
+        
+        with col_min:
+            cs_min = st.number_input(
+                f"Minimum value for color scale:",
+                value=st.session_state.get(colorscale_min_key, data_min),
+                format="%.4f",
+                key=f"{mode_key}_cs_min_input"
+            )
+            st.session_state[colorscale_min_key] = cs_min
+        
+        with col_max:
+            cs_max = st.number_input(
+                f"Maximum value for color scale:",
+                value=st.session_state.get(colorscale_max_key, data_max),
+                format="%.4f",
+                key=f"{mode_key}_cs_max_input"
+            )
+            st.session_state[colorscale_max_key] = cs_max
+        
+        # Validate inputs
+        if cs_min >= cs_max:
+            st.error("Minimum value must be less than maximum value.")
+            return
+        
+        st.markdown(f"**Data range:** {data_min:.4f} to {data_max:.4f} {unit_label}")
+
         # Create interpolated surface using griddata
         x_pts = scan_data["X"].values
         y_pts = scan_data["Y"].values
         z_pts = scan_data["property"].values
+        
+        # Clip Z values to colorscale range for visualization
+        z_pts_clipped = np.clip(z_pts, cs_min, cs_max)
         
         # Create a regular grid for interpolation
         x_min, x_max = x_pts.min(), x_pts.max()
@@ -778,16 +821,21 @@ def process_and_display_translation_scan(file_objs, options, mode_key="translati
         points = np.column_stack([x_pts, y_pts])
         ZI = griddata(points, z_pts, (XI, YI), method='cubic', fill_value=np.mean(z_pts))
         
-        # Create 3D surface plot
+        # Clip interpolated Z values to colorscale range
+        ZI_clipped = np.clip(ZI, cs_min, cs_max)
+        
+        # Create 3D surface plot with clipped colorscale
         fig = go.Figure(
             data=[
                 go.Surface(
                     x=XI,
                     y=YI,
                     z=ZI,
-                    surfacecolor=ZI,
+                    surfacecolor=ZI_clipped,
                     colorscale=options.get("colorscale", "Viridis"),
                     colorbar=dict(title=color_label),
+                    cmin=cs_min,
+                    cmax=cs_max,
                     hovertemplate="X: %{x:.3f} cm<br>Y: %{y:.3f} cm<br>" + property_label + ": %{z:.2f}" + unit_label + "<extra></extra>"
                 )
             ]
@@ -796,7 +844,8 @@ def process_and_display_translation_scan(file_objs, options, mode_key="translati
             scene=dict(
                 xaxis_title="X-position (cm)",
                 yaxis_title="Y-position (cm)",
-                zaxis_title=f"{property_label}{unit_label}"
+                zaxis_title=f"{property_label}{unit_label}",
+                zaxis=dict(range=[cs_min, cs_max])
             ),
             margin=dict(l=0, r=0, t=30, b=0),
             height=700,
