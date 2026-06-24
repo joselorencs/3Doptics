@@ -739,11 +739,9 @@ def process_and_display_translation_scan(file_objs, options, mode_key="translati
             st.session_state[data_key] = scan_data
             st.session_state[f"{mode_key}_property_name"] = property_name
             
-            # Initialize colorscale min/max with data range
-            if colorscale_min_key not in st.session_state:
-                st.session_state[colorscale_min_key] = float(scan_data["property"].min())
-            if colorscale_max_key not in st.session_state:
-                st.session_state[colorscale_max_key] = float(scan_data["property"].max())
+            # ALWAYS reset colorscale min/max with new data range (not just on first load)
+            st.session_state[colorscale_min_key] = float(scan_data["property"].min())
+            st.session_state[colorscale_max_key] = float(scan_data["property"].max())
 
         except Exception as e:
             st.error(f"Error processing translation scan data: {e}")
